@@ -1,15 +1,9 @@
 import logging
-import requests
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackContext, CallbackQueryHandler
-from telegram.constants import ParseMode
+import telegram
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
+import httpx
 import re
-from ratelimit import limits, sleep_and_retry
-from cachetools import LRUCache
-import backoff
-import time
-import json
-import unicodedata
 
 # Настройка логирования
 logging.basicConfig(
@@ -18,294 +12,105 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Конфигурация
-TELEGRAM_TOKEN = "7888772385:AAEGpPDVxsFBqjskcI__taTaa01VveBrVPM"
-OPENROUTER_API_KEY = "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"
-OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
-MODELS = [
-    "mistralai/devstral-small:free",
-    "deepseek/deepseek-r1:free",
-    "deepseek/deepseek-chat-v3-0324:free",
-    "agentica-org/deepcoder-14b-preview:free"
-]
-DEFAULT_MODEL = MODELS[0]
-MAX_MESSAGE_LENGTH = 4096  # Максимальная длина сообщения в Telegram
-RATE_LIMIT_PERIOD = 60  # Период в секундах (1 минута)
-RATE_LIMIT_CALLS = 3  # 3 запроса в минуту
-CACHE_SIZE = 100  # Размер кэша для ответов
-MAX_HISTORY = 50  # 50 сообщений в истории диалога
+# Список специальных символов Telegram для MarkdownV2
+TELEGRAM_MARKDOWN_SPECIAL_CHARS = r'([_\*\[\]\(\)~`>\#\+\-\=\|\{\}\.\!])'
 
-# Инициализация кэша и сессии
-cache = LRUCache(maxsize=CACHE_SIZE)
-session = requests.Session()
+def escape_markdown_v2(text: str) -> str:
+    """
+    Экранирует специальные символы для Telegram MarkdownV2.
+    """
+    return re.sub(TELEGRAM_MARKDOWN_SPECIAL_CHARS, r'\\\1', text)
 
-# Экранирование специальных символов для MarkdownV2
-def escape_markdown_v2(text):
-    """Экранирует все специальные символы для Telegram MarkdownV2."""
-    if not isinstance(text, str):
-        text = str(text)
-    special_chars = r'([_\*\[\]\(\)~`>\#\+\-=|\{\}\.!])'
-    return re.sub(special_chars, r'\\\1', text)
+def log_event(event_type: str, user_id: int, message: str, exc_info: bool = False):
+    """
+    Логирует событие с информацией о пользователе и, при необходимости, об исключении.
+    """
+    log_message = f"[{event_type}] User {user_id}: {message}"
+    if exc_info:
+        logger.exception(log_message)
+    else:
+        logger.info(log_message)
 
-# Проверка, содержит ли текст китайские иероглифы
-def is_non_russian(text):
-    """Проверяет, содержит ли текст китайские иероглифы (U+4E00–U+9FFF)."""
-    for char in text:
-        if 0x4E00 <= ord(char) <= 0x9FFF:  # Диапазон китайских иероглифов
-            return True
-    return False
-
-# Очистка текста от не-UTF-8 символов
-def clean_text(text):
-    """Очищает текст от не-UTF-8 символов и проверяет на китайские иероглифы."""
-    try:
-        # Нормализация Unicode
-        text = unicodedata.normalize('NFKC', text)
-        # Удаляем не-UTF-8 символы
-        text = text.encode('utf-8', errors='ignore').decode('utf-8')
-        # Проверяем на китайские иероглифы
-        if is_non_russian(text):
-            logger.warning(f"Chinese characters detected in response: {text[:50]}...")
-            return "Ошибка: Ответ содержит текст на китайском языке. Пожалуйста, повторите запрос."
-        return text
-    except Exception as e:
-        logger.error(f"Error cleaning text: {e}")
-        return text
-
-# Разбиение длинного сообщения
-def split_message(text, max_length=MAX_MESSAGE_LENGTH):
-    """Разбивает текст на части, не превышающие max_length."""
-    if len(text) <= max_length:
-        return [text]
-    
-    messages = []
-    while text:
-        if len(text) <= max_length:
-            messages.append(text)
-            break
-        split_pos = text[:max_length].rfind('\n')
-        if split_pos == -1:
-            split_pos = text[:max_length].rfind(' ')
-        if split_pos == -1:
-            split_pos = max_length
-        messages.append(text[:split_pos])
-        text = text[split_pos:].lstrip()
-    return messages
-
-# Форматирование кода для Telegram
-def format_code_block(code, language=""):
-    """Форматирует код в MarkdownV2 для Telegram."""
-    cleaned_code = clean_text(code)
-    if "Ошибка: Ответ содержит текст на китайском языке" in cleaned_code:
-        return cleaned_code
-    escaped_code = escape_markdown_v2(cleaned_code)
-    return f"```{language}\n{escaped_code}\n```"
-
-# Тестовый запрос к OpenRouter API
-async def test_openrouter_api():
-    """Выполняет тестовый запрос к OpenRouter API."""
-    headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-        "Content-Type": "application/json",
-        "User-Agent": "TelegramBot/1.0",
-        "HTTP-Referer": "https://your-bot-domain.com",
-        "X-Title": "TelegramOpenRouterBot"
-    }
-    payload = {
-        "model": DEFAULT_MODEL,
-        "messages": [{"role": "system", "content": "Отвечай на русском языке"}, {"role": "user", "content": "Тест"}]
-    }
-    
-    try:
-        response = session.post(OPENROUTER_API_URL, headers=headers, json=payload, timeout=10)
-        response.raise_for_status()
-        logger.info("Test API request successful")
-        return "Тест API успешен!"
-    except requests.exceptions.HTTPError as e:
-        logger.error(f"Test API request failed: {e}")
-        return f"Ошибка API: {str(e)}"
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Test API network error: {e}")
-        return "Ошибка сети при тестировании API."
-
-# Запрос к OpenRouter API
-@sleep_and_retry
-@limits(calls=RATE_LIMIT_CALLS, period=RATE_LIMIT_PERIOD)
-@backoff.on_exception(backoff.expo, requests.exceptions.RequestException, max_tries=3)
-async def query_openrouter(message, model=DEFAULT_MODEL, history=None):
-    """Отправляет запрос к OpenRouter API с кэшированием."""
-    cache_key = f"{model}:{message}:{json.dumps(history)}"
-    if cache_key in cache:
-        logger.info("Returning cached response")
-        return cache[cache_key]
-    
-    headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-        "Content-Type": "application/json",
-        "User-Agent": "TelegramBot/1.0",
-        "HTTP-Referer": "https://your-bot-domain.com",
-        "X-Title": "TelegramOpenRouterBot"
-    }
-    
-    # Усиленное системное сообщение
-    system_message = {
-        "role": "system",
-        "content": "Отвечай исключительно на русском языке. Не используй китайский, английский или другие языки, если только пользователь явно не попросит. Для кода используй Python, если не указано иное."
-    }
-    full_history = [system_message] + (history or [{"role": "user", "content": message}])
-    
-    payload = {
-        "model": model,
-        "messages": full_history
-    }
-    
-    try:
-        response = session.post(OPENROUTER_API_URL, headers=headers, json=payload, timeout=30)
-        response.raise_for_status()
-        data = response.json()
-        result = clean_text(data['choices'][0]['message']['content'])
-        cache[cache_key] = result  # Сохраняем в кэш
-        logger.info(f"API request successful, model: {model}, response: {result[:50]}...")
-        return result
-    except requests.exceptions.HTTPError as e:
-        logger.error(f"HTTP error from OpenRouter: {e}")
-        return f"Ошибка API: {str(e)}"
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Network error: {e}")
-        return "Ошибка сети. Попробуйте позже."
-    except (KeyError, IndexError) as e:
-        logger.error(f"Error parsing OpenRouter response: {e}")
-        return "Ошибка обработки ответа от API."
-
-# Обработчик команды /start
-async def start(update: Update, context: CallbackContext):
-    """Отправляет приветственное сообщение и очищает историю."""
-    context.user_data['history'] = []  # Очищаем историю
-    context.user_data['model'] = DEFAULT_MODEL
-    await update.message.reply_text(
-        "Привет! Я чат-бот, использующий OpenRouter API. Отправь мне сообщение, и я отвечу на русском!\n"
-        f"Текущая модель: {DEFAULT_MODEL}\n"
-        "Используй /models для выбора модели через кнопки.\n"
-        "Диалог сохраняется (до 50 сообщений).\n"
-        "Используй /clear для очистки истории диалога.\n"
-        "Используй /test_api для проверки API-ключа."
-    )
-
-# Обработчик команды /clear
-async def clear(update: Update, context: CallbackContext):
-    """Очищает историю диалога."""
-    context.user_data['history'] = []
-    await update.message.reply_text("История диалога очищена.")
-
-# Обработчик команды /test_api
-async def test_api(update: Update, context: CallbackContext):
-    """Проверяет API-ключ OpenRouter."""
-    result = await test_openrouter_api()
-    await update.message.reply_text(result)
-
-# Обработчик команды /models
-async def models(update: Update, context: CallbackContext):
-    """Показывает инлайн-кнопки для выбора модели."""
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /start."""
+    user_id = update.effective_user.id
+    log_event("Start command", user_id, "User initiated start command")
     keyboard = [
-        [InlineKeyboardButton(model, callback_data=f"model:{model}")] for model in MODELS
+        [telegram.InlineKeyboardButton("deepcoder", callback_data="model:deepcoder")],
+        [telegram.InlineKeyboardButton("mistral-small", callback_data="model:mistral-small")],
+        # Другие модели...
     ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text(
-        "Выберите модель:",
-        reply_markup=reply_markup
-    )
+    reply_markup = telegram.InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text("Выберите модель:", reply_markup=reply_markup)
 
-# Обработчик выбора модели через кнопки
-async def button_callback(update: Update, context: CallbackContext):
-    """Обрабатывает выбор модели через инлайн-кнопки."""
+async def callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик выбора модели."""
     query = update.callback_query
+    user_id = query.from_user.id
+    model = query.data.split(":")[1]
+    log_event("Model changed", user_id, f"New model: {model}")
     await query.answer()
-    model = query.data.split("model:")[1]
-    if model in MODELS:
-        context.user_data['model'] = model
-        await query.message.reply_text(f"Модель изменена на: {model}")
-    else:
-        await query.message.reply_text(f"Модель не найдена. Доступные модели: {', '.join(MODELS)}")
+    await query.message.edit_text(f"Выбрана модель: {model}")
 
-# Обработчик текстовых сообщений
-async def handle_message(update: Update, context: CallbackContext):
-    """Обрабатывает входящие текстовые сообщения."""
-    user_message = clean_text(update.message.text)
-    model = context.user_data.get('model', DEFAULT_MODEL)
-    
-    # Получаем или инициализируем историю
-    history = context.user_data.get('history', [])
-    
-    # Добавляем сообщение пользователя в историю
-    history.append({"role": "user", "content": user_message})
-    
-    # Ограничиваем историю
-    if len(history) > MAX_HISTORY:
-        history = history[-MAX_HISTORY:]
-    
-    # Запрос к OpenRouter
-    response = await query_openrouter(user_message, model, history)
-    
-    # Добавляем ответ бота в историю
-    history.append({"role": "assistant", "content": response})
-    context.user_data['history'] = history  # Сохраняем историю
-    
-    # Проверяем, содержит ли ответ код
-    if '```' in response:
-        parts = response.split('```')
-        formatted_response = ""
-        for i, part in enumerate(parts):
-            if i % 2 == 0:  # Текст вне кода
-                formatted_response += escape_markdown_v2(clean_text(part))
-            else:  # Код
-                lines = part.split('\n', 1)
-                language = lines[0].strip() if len(lines) > 1 and lines[0].strip() else ""
-                code = lines[1] if len(lines) > 1 else lines[0]
-                formatted_response += format_code_block(code, language)
-    else:
-        formatted_response = escape_markdown_v2(clean_text(response))
-    
-    # Разбиваем сообщение
-    messages = split_message(formatted_response)
-    
-    # Отправляем каждую часть
-    for msg in messages:
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик текстовых сообщений."""
+    user_id = update.effective_user.id
+    message_text = update.message.text
+    model = context.user_data.get("model", "deepcoder")  # Модель по умолчанию
+    model_id = {
+        "deepcoder": "agentica-org/deepcoder-14b-preview:free",
+        "mistral-small": "mistralai/devstral-small:free",
+        # Другие модели...
+    }.get(model, "agentica-org/deepcoder-14b-preview:free")
+
+    log_event("New request", user_id, f"Model: {model_id}\nMessage: '{message_text}'")
+
+    try:
+        # Запрос к OpenRouter API
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                json={
+                    "model": model_id,
+                    "messages": [{"role": "user", "content": message_text}]
+                },
+                headers={"Authorization": "Bearer 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"}  # Убедитесь, что ключ настроен
+            )
+            response.raise_for_status()
+            response_data = response.json()
+            reply_text = response_data["choices"][0]["message"]["content"]
+            log_event("API success", user_id, f"Response length: {len(reply_text)} chars")
+
+        # Попытка отправить с MarkdownV2
         try:
+            escaped_text = escape_markdown_v2(reply_text)
             await update.message.reply_text(
-                msg,
-                parse_mode=ParseMode.MARKDOWN_V2
+                escaped_text,
+                parse_mode=telegram.constants.ParseMode.MARKDOWN_V2
             )
-        except Exception as e:
-            logger.error(f"Error sending message: {e}")
-            await update.message.reply_text(
-                "Ошибка при отправке сообщения. Попробуйте снова."
-            )
+        except telegram.error.BadRequest as e:
+            log_event("Markdown error", user_id, "Falling back to plain text")
+            # Откат на обычный текст
+            await update.message.reply_text(reply_text)
 
-# Обработчик ошибок
-async def error_handler(update: Update, context: CallbackContext):
-    """Обрабатывает ошибки бота."""
-    logger.error(f"Update {update} caused error {context.error}")
-    if update and update.message:
-        await update.message.reply_text(
-            "Произошла ошибка. Попробуйте снова позже."
-        )
+    except httpx.HTTPStatusError as e:
+        error_msg = f"API error ❌ Ошибка {e.response.status_code}: {e.response.text}"
+        log_event("API error", user_id, error_msg)
+        await update.message.reply_text(error_msg)
+    except Exception as e:
+        error_msg = f"Unexpected error: {str(e)}"
+        log_event("Error", user_id, error_msg, exc_info=True)
+        await update.message.reply_text("Произошла ошибка, попробуйте позже.")
 
 def main():
-    """Запускает бота."""
-    logger.info("Starting bot...")
-    application = Application.builder().token(TELEGRAM_TOKEN).build()
-    
-    # Регистрация обработчиков
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("clear", clear))
-    application.add_handler(CommandHandler("test_api", test_api))
-    application.add_handler(CommandHandler("models", models))
-    application.add_handler(CallbackQueryHandler(button_callback, pattern="^model:"))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    application.add_error_handler(error_handler)
-    
-    # Запуск бота
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    """Запуск бота."""
+    log_event("BOT STARTED", 0, "=== BOT STARTED ===")
+    app = Application.builder().token("7888772385:AAEGpPDVxsFBqjskcI__taTaa01VveBrVPM").build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CallbackQueryHandler(callback_query, pattern="model:.*"))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    log_event("Polling started", 0, "Polling started")
+    app.run_polling()
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
