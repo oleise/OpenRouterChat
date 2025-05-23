@@ -19,8 +19,21 @@ TELEGRAM_MARKDOWN_SPECIAL_CHARS = r'([_\*\[\]\(\)~`>\#\+\-\=\|\{\}\.\!])'
 MAX_MESSAGE_LENGTH = 4096  # Ограничение длины сообщения в Telegram
 
 def escape_markdown_v2(text: str) -> str:
-    """Экранирует специальные символы для Telegram MarkdownV2."""
+    """Экранирует специальные символы для Telegram MarkdownV2, кроме блоков кода."""
     return re.sub(TELEGRAM_MARKDOWN_SPECIAL_CHARS, r'\\\1', text)
+
+def format_code_message(code: str, explanation: str = "") -> str:
+    """
+    Форматирует сообщение с кодом и пояснением для Telegram MarkdownV2.
+    Код отправляется как копируемый блок, пояснение — как текст.
+    """
+    # Код не экранируется, так как находится внутри ```python ... ```
+    code_block = f"```python\n{code}\n```"
+    if explanation:
+        # Экранируем только пояснение
+        escaped_explanation = escape_markdown_v2(explanation)
+        return f"{code_block}\n\n{escaped_explanation}"
+    return code_block
 
 def split_message(text: str, max_length: int = MAX_MESSAGE_LENGTH) -> list:
     """Разбивает длинное сообщение на части, не превышающие max_length."""
@@ -90,12 +103,30 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             response.raise_for_status()
             response_data = response.json()
             reply_text = response_data["choices"][0]["message"]["content"]
-            log_event("API success", user_id, f"Response length: {len(reply_text)} chars | Formatted: True")
+            log_event("API success", user_id, f"Response length: {len(reply_text)} chars")
 
-        # Попытка отправить с MarkdownV2
+        # Проверяем, содержит ли ответ код (ищем ``` или упоминание кода)
+        if "```" in reply_text or "код" in message_text.lower():
+            # Разделяем ответ на код и пояснение
+            code_match = re.search(r"```(?:python)?\n([\s\S]*?)\n```", reply_text)
+            if code_match:
+                code = code_match.group(1)
+                # Всё, что вне блока кода, считаем пояснением
+                explanation = re.sub(r"```(?:python)?\n[\s\S]*?\n```", "", reply_text).strip()
+            else:
+                # Если блок кода не найден, считаем весь текст кодом
+                code = reply_text
+                explanation = ""
+            
+            # Форматируем сообщение с копируемым кодом
+            formatted_message = format_code_message(code, explanation)
+        else:
+            # Для некодовых ответов экранируем весь текст
+            formatted_message = escape_markdown_v2(reply_text)
+
+        # Отправляем сообщение, разбивая на части, если нужно
         try:
-            escaped_text = escape_markdown_v2(reply_text)
-            for part in split_message(escaped_text):
+            for part in split_message(formatted_message):
                 await update.message.reply_text(
                     part,
                     parse_mode=telegram.constants.ParseMode.MARKDOWN_V2
