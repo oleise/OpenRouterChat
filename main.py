@@ -1,7 +1,7 @@
 import signal
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters
-from .config import TELEGRAM_TOKEN, logger
-from .handlers import start, callback_query, handle_message
+from OpenRouterChat.config import TELEGRAM_TOKEN, logger, MODELS
+from OpenRouterChat.handlers import start, callback_query, handle_message
 
 def handle_shutdown(app: Application) -> callable:
     """
@@ -38,5 +38,4 @@ def main() -> None:
     app.run_polling(poll_interval=0.1)
 
 if __name__ == "__main__":
-    from .config import MODELS, logger
     main()
