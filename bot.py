@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 # Конфигурация
 TELEGRAM_TOKEN = "7888772385:AAEGpPDVxsFBqjskcI__taTaa01VveBrVPM"
-OPENROUTER_API_KEY = "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"
+OPENROUTER_API_KEY = "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"
 OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
 MODELS = [
     "mistralai/devstral-small:free",
@@ -31,12 +31,13 @@ MODELS = [
 ]
 DEFAULT_MODEL = MODELS[0]
 MAX_MESSAGE_LENGTH = 4096  # Максимальная длина сообщения в Telegram
-RATE_LIMIT_PERIOD = 120  # 2 минуты
-RATE_LIMIT_CALLS = 2  # 2 запроса в 2 минуты
+RATE_LIMIT_PERIOD = 300  # 5 минут
+RATE_LIMIT_CALLS = 1  # 1 запрос в 5 минут
 CACHE_SIZE = 100  # Размер кэша для ответов
 MAX_HISTORY = 50  # 50 сообщений в истории диалога
 MAX_RETRIES = 3  # Максимум попыток для экспоненциального отката
-REQUEST_TIMEOUT = 15  # Таймаут запросов в секундах
+REQUEST_TIMEOUT = 10  # Таймаут запросов в секундах
+MAX_WAIT_TIME = 120  # Максимальное время ожидания при 429 (в секундах)
 
 # Инициализация кэша и сессии
 cache = LRUCache(maxsize=CACHE_SIZE)
@@ -62,14 +63,10 @@ def has_chinese(text):
 def clean_text(text, is_code=False):
     """Очищает текст от не-UTF-8 символов и проверяет на китайские иероглифы."""
     try:
-        # Нормализация Unicode
         text = unicodedata.normalize('NFKC', text)
-        # Удаляем не-UTF-8 символы
         text = text.encode('utf-8', errors='ignore').decode('utf-8')
-        # Пропускаем проверку на китайские символы для кода
         if is_code:
             return text
-        # Проверяем на китайские иероглифы
         if has_chinese(text):
             logger.warning(f"Chinese characters detected in response: {text[:50]}...")
             return "Ошибка: Ответ содержит текст на китайском языке. Пожалуйста, повторите запрос."
@@ -186,7 +183,7 @@ async def query_openrouter(message, model=DEFAULT_MODEL, history=None):
         response.raise_for_status()
         data = response.json()
         result = clean_text(data['choices'][0]['message']['content'])
-        cache[cache_key] = result  # Сохраняем в кэш
+        cache[cache_key] = result
         remaining_requests = response.headers.get('X-RateLimit-Remaining', 'Unknown')
         reset_time = response.headers.get('X-RateLimit-Reset', 'Unknown')
         logger.info(f"API request successful, model: {model}, response: {result[:50]}..., Remaining requests: {remaining_requests}, Reset time: {reset_time}")
@@ -195,7 +192,7 @@ async def query_openrouter(message, model=DEFAULT_MODEL, history=None):
         if e.response and e.response.status_code == 429:
             retry_after = e.response.headers.get('Retry-After', '60')
             try:
-                retry_after = int(retry_after)
+                retry_after = min(int(retry_after), MAX_WAIT_TIME)
             except ValueError:
                 retry_after = 60
             logger.warning(f"Rate limit hit, waiting {retry_after} seconds")
@@ -215,7 +212,7 @@ async def query_openrouter(message, model=DEFAULT_MODEL, history=None):
 # Обработчик команды /start
 async def start(update: Update, context: CallbackContext):
     """Отправляет приветственное сообщение и очищает историю."""
-    context.user_data['history'] = []  # Очищаем историю
+    context.user_data['history'] = []
     context.user_data['model'] = DEFAULT_MODEL
     await update.message.reply_text(
         "Привет! Я чат-бот, использующий OpenRouter API. Отправь мне сообщение, и я отвечу на русском!\n"
@@ -264,31 +261,22 @@ async def handle_message(update: Update, context: CallbackContext):
     model = context.user_data.get('model', DEFAULT_MODEL)
     
     logger.info(f"Processing user message: {user_message[:50]}...")
-    # Получаем или инициализируем историю
     history = context.user_data.get('history', [])
-    
-    # Добавляем сообщение пользователя в историю
     history.append({"role": "user", "content": user_message})
-    
-    # Ограничиваем историю
     if len(history) > MAX_HISTORY:
         history = history[-MAX_HISTORY:]
     
-    # Запрос к OpenRouter
     response = await query_openrouter(user_message, model, history)
-    
-    # Добавляем ответ бота в историю
     history.append({"role": "assistant", "content": response})
-    context.user_data['history'] = history  # Сохраняем историю
+    context.user_data['history'] = history
     
-    # Проверяем, содержит ли ответ код
     if '```' in response:
         parts = response.split('```')
         formatted_response = ""
         for i, part in enumerate(parts):
-            if i % 2 == 0:  # Текст вне кода
+            if i % 2 == 0:
                 formatted_response += escape_markdown_v2(clean_text(part, is_code=False))
-            else:  # Код
+            else:
                 lines = part.split('\n', 1)
                 language = lines[0].strip() if len(lines) > 1 and lines[0].strip() else ""
                 code = lines[1] if len(lines) > 1 else lines[0]
@@ -296,10 +284,7 @@ async def handle_message(update: Update, context: CallbackContext):
     else:
         formatted_response = escape_markdown_v2(clean_text(response, is_code=False))
     
-    # Разбиваем сообщение
     messages = split_message(formatted_response)
-    
-    # Отправляем каждую часть
     for msg in messages:
         try:
             await update.message.reply_text(
@@ -327,7 +312,6 @@ def main():
     logger.info("Starting bot...")
     application = Application.builder().token(TELEGRAM_TOKEN).build()
     
-    # Регистрация обработчиков
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("clear", clear))
     application.add_handler(CommandHandler("check_key", check_key_command))
@@ -337,7 +321,6 @@ def main():
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.add_error_handler(error_handler)
     
-    # Запуск бота
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__':
