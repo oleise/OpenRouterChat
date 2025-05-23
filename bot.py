@@ -16,6 +16,7 @@ from telegram.ext import (
     filters,
     ContextTypes,
 )
+from telegram.error import BadRequest
 
 # Настройка логирования
 logging.basicConfig(
@@ -42,33 +43,35 @@ MODELS = {
 
 current_model = MODELS["mistral-small"]
 
+def escape_markdown(text: str) -> str:
+    """Экранирует специальные символы MarkdownV2"""
+    escape_chars = r'_*[]()~`>#+-=|{}.!'
+    return re.sub(f'([{re.escape(escape_chars)}])', r'\\\1', text)
+
 def format_code_blocks(text: str) -> str:
     """
     Форматирует только блоки кода в тексте для Telegram,
     оставляя обычный текст без изменений.
     """
-    def escape_special_chars(match):
+    def process_code_block(match):
         lang = match.group(1) or ''
         code = match.group(2)
-        # Экранируем специальные символы MarkdownV2
-        escaped_code = re.sub(r'([_*\[\]()~`>#+\-=|{}.!])', r'\\\1', code)
+        escaped_code = escape_markdown(code)
         return f'```{lang}\n{escaped_code}\n```'
     
-    # Ищем все блоки кода и форматируем только их
-    formatted_text = re.sub(
+    return re.sub(
         r'```(\w*)\n(.*?)```',
-        escape_special_chars,
+        process_code_block,
         text,
         flags=re.DOTALL
     )
-    
-    return formatted_text if '```' in formatted_text else text
 
-def log_event(event: str, user_id: int = None, details: str = ""):
+def log_event(event: str, user_id: int = None, details: str = "", error: Exception = None):
     """Логирование событий с timestamp"""
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     user_info = f"User {user_id}: " if user_id else ""
-    log_message = f"[{timestamp}] {user_info}{event} {details}"
+    error_info = f" | Error: {str(error)}" if error else ""
+    log_message = f"[{timestamp}] {user_info}{event} {details}{error_info}"
     logger.info(log_message)
     print(log_message)
 
@@ -99,12 +102,23 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     current_model = MODELS[model_key]
     
-    log_event(f"Model changed", user.id, f"New model: {model_key}")
+    log_event("Model changed", user.id, f"New model: {model_key}")
     
     await query.edit_message_text(
         f"✅ Выбрана модель: {current_model.split('/')[-1].replace(':free', '')}\n"
         "Отправьте мне сообщение для обработки."
     )
+
+async def safe_reply_text(update: Update, text: str, parse_mode: str = None):
+    """Безопасная отправка сообщения с обработкой ошибок форматирования"""
+    try:
+        await update.message.reply_text(text, parse_mode=parse_mode)
+    except BadRequest as e:
+        if "Can't parse entities" in str(e):
+            log_event("Markdown error", update.effective_user.id, "Falling back to plain text")
+            await update.message.reply_text(escape_markdown(text))
+        else:
+            raise
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -136,18 +150,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             if response.status_code == 200:
                 answer = response.json()["choices"][0]["message"]["content"]
-                
-                # Форматируем только блоки кода в ответе
                 formatted_answer = format_code_blocks(answer)
-                
-                # Определяем нужен ли parse_mode
                 use_markdown = '```' in formatted_answer
                 
                 log_event("API success", user.id, 
                          f"Response length: {len(answer)} chars | "
                          f"Formatted: {use_markdown}")
                 
-                await update.message.reply_text(
+                await safe_reply_text(
+                    update,
                     formatted_answer,
                     parse_mode=ParseMode.MARKDOWN_V2 if use_markdown else None
                 )
@@ -163,7 +174,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
     except Exception as e:
         error_msg = f"⚠️ Ошибка: {str(e)}"
-        log_event("Error", user.id, error_msg, exc_info=True)
+        log_event("Error", user.id, error_msg, error=e)
         await update.message.reply_text(error_msg)
 
 async def model_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -185,5 +196,5 @@ if __name__ == "__main__":
         app.run_polling()
         
     except Exception as e:
-        log_event("FATAL ERROR", details=str(e), exc_info=True)
+        log_event("FATAL ERROR", details=str(e), error=e)
         raise
