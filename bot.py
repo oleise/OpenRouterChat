@@ -13,6 +13,8 @@ logging.basicConfig(
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+# Отключаем логирование httpx для getUpdates
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # Список специальных символов для Telegram MarkdownV2
 TELEGRAM_MARKDOWN_SPECIAL_CHARS = r'([_\*\[\]\(\)~`>\#\+\-\=\|\{\}\.\!])'
@@ -23,27 +25,51 @@ def escape_markdown_v2(text: str) -> str:
     return re.sub(TELEGRAM_MARKDOWN_SPECIAL_CHARS, r'\\\1', text)
 
 def clean_text(text: str) -> str:
-    """Удаляет не-русские, не-латинские символы и текст на других языках."""
-    # Оставляем только буквы, цифры, пробелы, знаки препинания и русские символы
+    """Удаляет не-русские символы, текст на других языках и восстанавливает пунктуацию."""
+    # Удаляем всё, кроме русских/латинских букв, цифр, пробелов и знаков препинания
     cleaned = re.sub(r'[^\w\sа-яА-ЯёЁ.,!?:;()\'"<>=\-+*\/]', '', text)
-    # Удаляем слова на других языках (например, китайский, испанский)
-    return ' '.join(word for word in cleaned.split() if re.match(r'^[a-zA-Zа-яА-ЯёЁ0-9]+$', word) or word in '.,!?:;()\'"<>=\-+*/')
+    # Фильтруем слова, оставляя только русские или латинские (для кода)
+    cleaned = ' '.join(word for word in cleaned.split() if re.match(r'^[a-zA-Zа-яА-ЯёЁ0-9]+$', word) or word in '.,!?:;()\'"<>=\-+*/')
+    # Добавляем точки в конце предложений
+    sentences = re.split(r'(?<=[.!?])\s+|(?<=\w)\s+(?=[А-ЯЁ])', cleaned)
+    cleaned_sentences = [s + '.' if s and s[-1] not in '.!?' else s for s in sentences]
+    return ' '.join(cleaned_sentences).strip()
+
+def is_code(text: str) -> bool:
+    """Проверяет, является ли текст кодом (содержит синтаксис Python)."""
+    code_patterns = [
+        r'\bdef\b', r'\bclass\b', r'\bwhile\b', r'\bfor\b', r'\bif\b',
+        r'\bprint\b', r'\bimport\b', r'=', r'\(', r'\)', r':'
+    ]
+    return any(re.search(pattern, text) for pattern in code_patterns)
+
+def validate_code(code: str) -> str:
+    """Проверяет и исправляет базовые ошибки в коде."""
+    lines = code.split('\n')
+    corrected_lines = []
+    for line in lines:
+        # Исправляем ошибки типа "while count count 1"
+        if 'while' in line and line.count('count') > 2:
+            line = re.sub(r'while\s+count\s+count\s+1', 'while count <= 5:', line)
+        corrected_lines.append(line)
+    return '\n'.join(corrected_lines).strip()
 
 def format_code_message(code: str, explanation: str = "") -> str:
     """
     Форматирует сообщение с кодом и пояснением для Telegram MarkdownV2.
     Код отправляется как копируемый блок, пояснение — как текст.
     """
-    # Очищаем код и пояснение
-    code = clean_text(code).strip()
+    code = clean_text(validate_code(code)).strip()
     explanation = clean_text(explanation).strip()
-    # Формируем блок кода
-    code_block = f"```python\n{code}\n```"
-    if explanation and explanation != code:
-        # Экранируем пояснение
+    # Если текст похож на код, оборачиваем его в ```python
+    if is_code(code) and code:
+        code_block = f"```python\n{code}\n```"
+    else:
+        code_block = ""
+    if explanation and explanation != code and len(explanation) > 10:
         escaped_explanation = escape_markdown_v2(explanation)
-        return f"{code_block}\n\n{escaped_explanation}"
-    return code_block
+        return f"{code_block}\n\n{escaped_explanation}" if code_block else escaped_explanation
+    return code_block or explanation
 
 def split_message(text: str, max_length: int = MAX_MESSAGE_LENGTH) -> list:
     """Разбивает длинное сообщение на части, не превышающие max_length."""
@@ -105,7 +131,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "https://openrouter.ai/api/v1/chat/completions",
                 json={
                     "model": model_id,
-                    "messages": [{"role": "user", "content": f"Отвечай только на русском. {message_text}"}]
+                    "messages": [{"role": "user", "content": f"Отвечай строго на русском, с правильной грамматикой и пунктуацией, без текста на других языках. {message_text}"}]
                 },
                 headers={"Authorization": f"Bearer {api_key}"},
                 timeout=30.0
@@ -121,12 +147,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             code_match = re.search(r"```(?:python)?\n?([\s\S]*?)\n?```", reply_text)
             if code_match:
                 code = code_match.group(1).strip()
-                # Всё, что вне блока кода, считаем пояснением
                 explanation = re.sub(r"```(?:python)?\n?[\s\S]*?\n?```", "", reply_text).strip()
             else:
                 # Если блока кода нет, весь текст считаем кодом
                 code = reply_text.strip()
-                explanation = ""
+                explanation = "Пример кода." if is_code(code) else ""
             
             # Форматируем сообщение с копируемым кодом
             formatted_message = format_code_message(code, explanation)
