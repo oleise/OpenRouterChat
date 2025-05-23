@@ -31,11 +31,12 @@ MODELS = [
 ]
 DEFAULT_MODEL = MODELS[0]
 MAX_MESSAGE_LENGTH = 4096  # Максимальная длина сообщения в Telegram
-RATE_LIMIT_PERIOD = 300  # 5 минут
-RATE_LIMIT_CALLS = 1  # 1 запрос в 5 минут
+RATE_LIMIT_PERIOD = 120  # 2 минуты
+RATE_LIMIT_CALLS = 2  # 2 запроса в 2 минуты
 CACHE_SIZE = 100  # Размер кэша для ответов
 MAX_HISTORY = 50  # 50 сообщений в истории диалога
-MAX_RETRIES = 5  # Максимум попыток для экспоненциального отката
+MAX_RETRIES = 3  # Максимум попыток для экспоненциального отката
+REQUEST_TIMEOUT = 15  # Таймаут запросов в секундах
 
 # Инициализация кэша и сессии
 cache = LRUCache(maxsize=CACHE_SIZE)
@@ -106,9 +107,9 @@ def format_code_block(code, language=""):
     escaped_code = escape_markdown_v2(cleaned_code)
     return f"```{language}\n{escaped_code}\n```"
 
-# Проверка состояния API
-async def test_openrouter_api():
-    """Выполняет тестовый запрос к OpenRouter API."""
+# Проверка статуса API-ключа
+async def check_key():
+    """Проверяет статус API-ключа OpenRouter."""
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
@@ -121,28 +122,35 @@ async def test_openrouter_api():
         "messages": [{"role": "system", "content": "Отвечай на русском языке"}, {"role": "user", "content": "Тест"}]
     }
     
+    logger.info("Checking OpenRouter API key status...")
     try:
-        response = session.post(OPENROUTER_API_URL, headers=headers, json=payload, timeout=10)
+        response = session.post(OPENROUTER_API_URL, headers=headers, json=payload, timeout=REQUEST_TIMEOUT)
         response.raise_for_status()
         remaining_requests = response.headers.get('X-RateLimit-Remaining', 'Unknown')
         reset_time = response.headers.get('X-RateLimit-Reset', 'Unknown')
-        logger.info(f"Test API request successful. Remaining requests: {remaining_requests}, Reset time: {reset_time}")
-        return f"Тест API успешен! Осталось запросов: {remaining_requests}, Сброс лимита: {reset_time}"
+        logger.info(f"API key check successful. Remaining requests: {remaining_requests}, Reset time: {reset_time}")
+        return f"API-ключ активен! Осталось запросов: {remaining_requests}, Сброс лимита: {reset_time}"
     except requests.exceptions.HTTPError as e:
         retry_after = e.response.headers.get('Retry-After', 'Unknown') if e.response else 'Unknown'
-        logger.error(f"Test API request failed: {e}, Retry-After: {retry_after}")
+        logger.error(f"API key check failed: {e}, Retry-After: {retry_after}")
         return f"Ошибка API: {str(e)}, Retry-After: {retry_after}"
     except requests.exceptions.RequestException as e:
-        logger.error(f"Test API network error: {e}")
-        return "Ошибка сети при тестировании API."
+        logger.error(f"API key check network error: {e}")
+        return "Ошибка сети при проверке API-ключа."
+
+# Команда /check_key
+async def check_key_command(update: Update, context: CallbackContext):
+    """Проверяет статус API-ключа OpenRouter."""
+    result = await check_key()
+    await update.message.reply_text(result)
 
 # Команда /status
 async def status(update: Update, context: CallbackContext):
     """Проверяет текущие лимиты OpenRouter API."""
-    result = await test_openrouter_api()
+    result = await check_key()
     await update.message.reply_text(result)
 
-# Запрос к OpenRouter API с экспоненциальным откатом
+# Запрос к OpenRouter API
 @sleep_and_retry
 @limits(calls=RATE_LIMIT_CALLS, period=RATE_LIMIT_PERIOD)
 @backoff.on_exception(backoff.expo, requests.exceptions.HTTPError, max_tries=MAX_RETRIES, giveup=lambda e: e.response is None or e.response.status_code != 429)
@@ -172,8 +180,9 @@ async def query_openrouter(message, model=DEFAULT_MODEL, history=None):
         "messages": full_history
     }
     
+    logger.info(f"Sending request to OpenRouter, model: {model}, message: {message[:50]}...")
     try:
-        response = session.post(OPENROUTER_API_URL, headers=headers, json=payload, timeout=30)
+        response = session.post(OPENROUTER_API_URL, headers=headers, json=payload, timeout=REQUEST_TIMEOUT)
         response.raise_for_status()
         data = response.json()
         result = clean_text(data['choices'][0]['message']['content'])
@@ -188,10 +197,10 @@ async def query_openrouter(message, model=DEFAULT_MODEL, history=None):
             try:
                 retry_after = int(retry_after)
             except ValueError:
-                retry_after = 60  # По умолчанию 60 секунд
+                retry_after = 60
             logger.warning(f"Rate limit hit, waiting {retry_after} seconds")
             await asyncio.sleep(retry_after)
-            raise  # Повторяем попытку через backoff
+            raise
         logger.error(f"HTTP error from OpenRouter: {e}")
         return f"Ошибка API: {str(e)}"
     except requests.exceptions.RequestException as e:
@@ -200,6 +209,8 @@ async def query_openrouter(message, model=DEFAULT_MODEL, history=None):
     except (KeyError, IndexError) as e:
         logger.error(f"Error parsing OpenRouter response: {e}")
         return "Ошибка обработки ответа от API."
+    finally:
+        logger.info("Request to OpenRouter completed")
 
 # Обработчик команды /start
 async def start(update: Update, context: CallbackContext):
@@ -212,7 +223,7 @@ async def start(update: Update, context: CallbackContext):
         "Используй /models для выбора модели через кнопки.\n"
         "Диалог сохраняется (до 50 сообщений).\n"
         "Используй /clear для очистки истории диалога.\n"
-        "Используй /test_api для проверки API-ключа.\n"
+        "Используй /check_key для проверки API-ключа.\n"
         "Используй /status для проверки лимитов API."
     )
 
@@ -221,12 +232,6 @@ async def clear(update: Update, context: CallbackContext):
     """Очищает историю диалога."""
     context.user_data['history'] = []
     await update.message.reply_text("История диалога очищена.")
-
-# Обработчик команды /test_api
-async def test_api(update: Update, context: CallbackContext):
-    """Проверяет API-ключ OpenRouter."""
-    result = await test_openrouter_api()
-    await update.message.reply_text(result)
 
 # Обработчик команды /models
 async def models(update: Update, context: CallbackContext):
@@ -258,6 +263,7 @@ async def handle_message(update: Update, context: CallbackContext):
     user_message = clean_text(update.message.text, is_code=False)
     model = context.user_data.get('model', DEFAULT_MODEL)
     
+    logger.info(f"Processing user message: {user_message[:50]}...")
     # Получаем или инициализируем историю
     history = context.user_data.get('history', [])
     
@@ -305,6 +311,7 @@ async def handle_message(update: Update, context: CallbackContext):
             await update.message.reply_text(
                 "Ошибка при отправке сообщения. Попробуйте снова."
             )
+    logger.info(f"Message processed and sent: {user_message[:50]}")
 
 # Обработчик ошибок
 async def error_handler(update: Update, context: CallbackContext):
@@ -323,7 +330,7 @@ def main():
     # Регистрация обработчиков
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("clear", clear))
-    application.add_handler(CommandHandler("test_api", test_api))
+    application.add_handler(CommandHandler("check_key", check_key_command))
     application.add_handler(CommandHandler("status", status))
     application.add_handler(CommandHandler("models", models))
     application.add_handler(CallbackQueryHandler(button_callback, pattern="^model:"))
