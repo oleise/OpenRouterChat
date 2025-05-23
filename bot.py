@@ -1,13 +1,14 @@
 import logging
 import requests
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackContext
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackContext, CallbackQueryHandler
 from telegram.constants import ParseMode
 import re
 from ratelimit import limits, sleep_and_retry
 from cachetools import LRUCache
 import backoff
 import time
+import json
 
 # Настройка логирования
 logging.basicConfig(
@@ -29,8 +30,9 @@ MODELS = [
 DEFAULT_MODEL = MODELS[0]
 MAX_MESSAGE_LENGTH = 4096  # Максимальная длина сообщения в Telegram
 RATE_LIMIT_PERIOD = 60  # Период в секундах (1 минута)
-RATE_LIMIT_CALLS = 10  # Максимум 10 запросов в минуту
+RATE_LIMIT_CALLS = 5  # Уменьшено до 5 запросов в минуту для безопасности
 CACHE_SIZE = 100  # Размер кэша для ответов
+MAX_HISTORY = 10  # Максимум 10 сообщений в истории диалога
 
 # Инициализация кэша и сессии
 cache = LRUCache(maxsize=CACHE_SIZE)
@@ -72,9 +74,9 @@ def format_code_block(code, language=""):
 @sleep_and_retry
 @limits(calls=RATE_LIMIT_CALLS, period=RATE_LIMIT_PERIOD)
 @backoff.on_exception(backoff.expo, requests.exceptions.RequestException, max_tries=3)
-async def query_openrouter(message, model=DEFAULT_MODEL):
+async def query_openrouter(message, model=DEFAULT_MODEL, history=None):
     """Отправляет запрос к OpenRouter API с кэшированием и возвращает ответ."""
-    cache_key = f"{model}:{message}"
+    cache_key = f"{model}:{message}:{json.dumps(history)}"
     if cache_key in cache:
         logger.info("Returning cached response")
         return cache[cache_key]
@@ -82,11 +84,12 @@ async def query_openrouter(message, model=DEFAULT_MODEL):
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
-        "User-Agent": "TelegramBot/1.0"  # Добавляем User-Agent для идентификации
+        "User-Agent": "TelegramBot/1.0",
+        "HTTP-Referer": "https://your-bot-domain.com"  # Замените на ваш домен или оставьте как есть
     }
     payload = {
         "model": model,
-        "messages": [{"role": "user", "content": message}]
+        "messages": history or [{"role": "user", "content": message}]
     }
     
     try:
@@ -95,7 +98,7 @@ async def query_openrouter(message, model=DEFAULT_MODEL):
         data = response.json()
         result = data['choices'][0]['message']['content']
         cache[cache_key] = result  # Сохраняем в кэш
-        logger.info(f"API request successful, model: {model}")
+        logger.info(f"API request successful, model: {model}, response: {result[:50]}...")
         return result
     except requests.exceptions.HTTPError as e:
         logger.error(f"HTTP error from OpenRouter: {e}")
@@ -109,33 +112,39 @@ async def query_openrouter(message, model=DEFAULT_MODEL):
 
 # Обработчик команды /start
 async def start(update: Update, context: CallbackContext):
-    """Отправляет приветственное сообщение."""
+    """Отправляет приветственное сообщение и очищает историю."""
+    context.user_data['history'] = []  # Очищаем историю при старте
+    context.user_data['model'] = DEFAULT_MODEL
     await update.message.reply_text(
         "Привет! Я чат-бот, использующий OpenRouter API. Отправь мне сообщение, и я отвечу!\n"
         f"Текущая модель: {DEFAULT_MODEL}\n"
-        f"Доступные модели: {', '.join(MODELS)}\n"
-        "Используй /model <имя_модели> для смены модели."
+        "Используй /models для выбора модели через кнопки.\n"
+        "Диалог сохраняется (до 10 сообщений)."
     )
 
-# Обработчик команды /model
-async def set_model(update: Update, context: CallbackContext):
-    """Меняет модель для запросов."""
-    if not context.args:
-        await update.message.reply_text(
-            f"Текущая модель: {context.user_data.get('model', DEFAULT_MODEL)}\n"
-            f"Доступные модели: {', '.join(MODELS)}\n"
-            "Используй: /model <имя_модели>"
-        )
-        return
-    
-    model = ' '.join(context.args)
+# Обработчик команды /models
+async def models(update: Update, context: CallbackContext):
+    """Показывает инлайн-кнопки для выбора модели."""
+    keyboard = [
+        [InlineKeyboardButton(model, callback_data=f"model:{model}")] for model in MODELS
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text(
+        "Выберите модель:",
+        reply_markup=reply_markup
+    )
+
+# Обработчик выбора модели через кнопки
+async def button_callback(update: Update, context: CallbackContext):
+    """Обрабатывает выбор модели через инлайн-кнопки."""
+    query = update.callback_query
+    await query.answer()
+    model = query.data.split("model:")[1]
     if model in MODELS:
         context.user_data['model'] = model
-        await update.message.reply_text(f"Модель изменена на: {model}")
+        await query.message.reply_text(f"Модель изменена на: {model}")
     else:
-        await update.message.reply_text(
-            f"Модель не найдена. Доступные модели: {', '.join(MODELS)}"
-        )
+        await query.message.reply_text(f"Модель не найдена. Доступные модели: {', '.join(MODELS)}")
 
 # Обработчик текстовых сообщений
 async def handle_message(update: Update, context: CallbackContext):
@@ -143,10 +152,24 @@ async def handle_message(update: Update, context: CallbackContext):
     user_message = update.message.text
     model = context.user_data.get('model', DEFAULT_MODEL)
     
-    # Запрос к OpenRouter
-    response = await query_openrouter(user_message, model)
+    # Получаем или инициализируем историю
+    history = context.user_data.get('history', [])
     
-    # Проверяем, содержит ли ответ код (ищем ``` в ответе)
+    # Добавляем сообщение пользователя в историю
+    history.append({"role": "user", "content": user_message})
+    
+    # Ограничиваем историю до MAX_HISTORY сообщений
+    if len(history) > MAX_HISTORY:
+        history = history[-MAX_HISTORY:]
+    
+    # Запрос к OpenRouter с историей
+    response = await query_openrouter(user_message, model, history)
+    
+    # Добавляем ответ бота в историю
+    history.append({"role": "assistant", "content": response})
+    context.user_data['history'] = history  # Сохраняем историю
+    
+    # Проверяем, содержит ли ответ код
     if '```' in response:
         parts = response.split('```')
         formatted_response = ""
@@ -188,11 +211,15 @@ async def error_handler(update: Update, context: CallbackContext):
 
 def main():
     """Запускает бота."""
+    # Задержка перед первым запросом для предотвращения холодного старта
+    time.sleep(2)
+    
     application = Application.builder().token(TELEGRAM_TOKEN).build()
     
     # Регистрация обработчиков
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("model", set_model))
+    application.add_handler(CommandHandler("models", models))
+    application.add_handler(CallbackQueryHandler(button_callback, pattern="^model:"))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.add_error_handler(error_handler)
     
