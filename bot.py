@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 # Конфигурация
 TELEGRAM_TOKEN = "7888772385:AAEGpPDVxsFBqjskcI__taTaa01VveBrVPM"
-OPENROUTER_API_KEY = "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"
+OPENROUTER_API_KEY = "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"
 OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
 MODELS = [
     "mistralai/devstral-small:free",
