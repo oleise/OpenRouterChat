@@ -2,7 +2,7 @@ import re
 from typing import List, Optional
 from telegram import Update
 from telegram.constants import ParseMode
-from .config import MAX_MESSAGE_LENGTH, TELEGRAM_MARKDOWN_SPECIAL_CHARS, logger
+from OpenRouterChat.config import MAX_MESSAGE_LENGTH, TELEGRAM_MARKDOWN_SPECIAL_CHARS, logger
 
 def escape_markdown_v2(text: str) -> str:
     """
