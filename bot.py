@@ -25,11 +25,11 @@ def escape_markdown_v2(text: str) -> str:
     return re.sub(TELEGRAM_MARKDOWN_SPECIAL_CHARS, r'\\\1', text)
 
 def clean_text(text: str) -> str:
-    """Удаляет не-русские символы, текст на других языках и восстанавливает пунктуацию."""
-    # Удаляем всё, кроме русских/латинских букв, цифр, пробелов и знаков препинания
-    cleaned = re.sub(r'[^\w\sа-яА-ЯёЁ.,!?:;()\'"<>=\-+*\/]', '', text)
+    """Фильтрует слова на других языках и восстанавливает базовую пунктуацию."""
     # Фильтруем слова, оставляя только русские или латинские (для кода)
-    cleaned = ' '.join(word for word in cleaned.split() if re.match(r'^[a-zA-Zа-яА-ЯёЁ0-9]+$', word) or word in '.,!?:;()\'"<>=\-+*/')
+    words = text.split()
+    filtered_words = [word for word in words if re.match(r'^[a-zA-Zа-яА-ЯёЁ0-9]+$', word) or word in '.,!?:;()\'"<>=\-+*/']
+    cleaned = ' '.join(filtered_words)
     # Добавляем точки в конце предложений
     sentences = re.split(r'(?<=[.!?])\s+|(?<=\w)\s+(?=[А-ЯЁ])', cleaned)
     cleaned_sentences = [s + '.' if s and s[-1] not in '.!?' else s for s in sentences]
@@ -131,7 +131,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "https://openrouter.ai/api/v1/chat/completions",
                 json={
                     "model": model_id,
-                    "messages": [{"role": "user", "content": f"Отвечай строго на русском, с правильной грамматикой и пунктуацией, без текста на других языках. {message_text}"}]
+                    "messages": [{"role": "user", "content": f"Отвечай строго на русском, с правильной грамматикой и пунктуацией, без текста на других языках. Форматируй код в блоках ```python. {message_text}"}]
                 },
                 headers={"Authorization": f"Bearer {api_key}"},
                 timeout=30.0
