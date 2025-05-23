@@ -22,13 +22,20 @@ def escape_markdown_v2(text: str) -> str:
     """Экранирует специальные символы для Telegram MarkdownV2, кроме блоков кода."""
     return re.sub(TELEGRAM_MARKDOWN_SPECIAL_CHARS, r'\\\1', text)
 
+def clean_text(text: str) -> str:
+    """Удаляет не-русские и не-латинские символы, оставляя только безопасные."""
+    return re.sub(r'[^\w\sа-яА-ЯёЁ.,!?:;()\'"<>=\-+*\/]', '', text)
+
 def format_code_message(code: str, explanation: str = "") -> str:
     """
     Форматирует сообщение с кодом и пояснением для Telegram MarkdownV2.
     Код отправляется как копируемый блок, пояснение — как текст.
     """
+    # Очищаем код и пояснение от нежелательных символов
+    code = clean_text(code)
+    explanation = clean_text(explanation)
     # Код не экранируется, так как находится внутри ```python ... ```
-    code_block = f"```python\n{code}\n```"
+    code_block = f"```python\n{code.strip()}\n```"
     if explanation:
         # Экранируем только пояснение
         escaped_explanation = escape_markdown_v2(explanation)
@@ -105,8 +112,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_text = response_data["choices"][0]["message"]["content"]
             log_event("API success", user_id, f"Response length: {len(reply_text)} chars")
 
-        # Проверяем, содержит ли ответ код (ищем ``` или упоминание кода)
-        if "```" in reply_text or "код" in message_text.lower():
+        # Проверяем, содержит ли запрос упоминание кода или цикл
+        if "код" in message_text.lower() or "while" in message_text.lower() or "```" in reply_text:
             # Разделяем ответ на код и пояснение
             code_match = re.search(r"```(?:python)?\n([\s\S]*?)\n```", reply_text)
             if code_match:
@@ -116,13 +123,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 # Если блок кода не найден, считаем весь текст кодом
                 code = reply_text
-                explanation = ""
+                explanation = "Пример кода с циклом while." if "while" in message_text.lower() else ""
             
             # Форматируем сообщение с копируемым кодом
             formatted_message = format_code_message(code, explanation)
         else:
             # Для некодовых ответов экранируем весь текст
-            formatted_message = escape_markdown_v2(reply_text)
+            formatted_message = escape_markdown_v2(clean_text(reply_text))
 
         # Отправляем сообщение, разбивая на части, если нужно
         try:
@@ -134,7 +141,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except telegram.error.BadRequest as e:
             log_event("Markdown error", user_id, f"Falling back to plain text: {str(e)}")
             # Откат на обычный текст
-            for part in split_message(reply_text):
+            for part in split_message(clean_text(reply_text)):
                 await update.message.reply_text(part)
 
     except httpx.HTTPStatusError as e:
