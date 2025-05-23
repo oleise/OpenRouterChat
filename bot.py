@@ -6,6 +6,8 @@ import telegram
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 import httpx
+from cachetools import TTLCache
+import asyncio
 
 # Настройка логирования
 logging.basicConfig(
@@ -19,6 +21,9 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 # Отключаем логирование httpx для getUpdates
 logging.getLogger("httpx").setLevel(logging.WARNING)
+
+# Кэш для ответов (TTL 1 час, до 1000 записей)
+cache = TTLCache(maxsize=1000, ttl=3600)
 
 # Список специальных символов для Telegram MarkdownV2
 TELEGRAM_MARKDOWN_SPECIAL_CHARS = r'([_\*\[\]\(\)~`>\#\+\-\=\|\{\}\.\!])'
@@ -34,7 +39,7 @@ def clean_text(text: str) -> str:
     """Добавляет базовую пунктуацию и минимально очищает текст."""
     if not text:
         return ""
-    # Удаляем только управляющие символы, оставляем иероглифы и другие символы
+    # Удаляем только управляющие символы
     cleaned = re.sub(r'[\x00-\x1F\x7F]', '', text)
     # Добавляем точки в конце предложений
     sentences = re.split(r'(?<=[.!?])\s+|(?<=\w)\s+(?=[А-ЯЁ])', cleaned.strip())
@@ -67,7 +72,7 @@ def validate_code(code: str) -> str:
 def format_code_message(code: str, explanation: str = "") -> str:
     """
     Форматирует сообщение с кодом и пояснением для Telegram MarkdownV2.
-    Код отправляется как копiруемый блок, пояснение — как текст.
+    Код отправляется как копируемый блок, пояснение — как текст.
     """
     code = validate_code(clean_text(code)).strip()
     explanation = clean_text(explanation).strip()
@@ -137,26 +142,57 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     log_event("New request", user_id, f"Model: {model_id}\nMessage: '{message_text}'")
 
+    # Проверяем кэш для кодовых запросов
+    cache_key = f"{model_id}:{message_text.lower()}"
+    if "код" in message_text.lower() or "while" in message_text.lower() or "for" in message_text.lower():
+        cached_response = cache.get(cache_key)
+        if cached_response:
+            log_event("Cache hit", user_id, f"Returning cached response for: {message_text}")
+            try:
+                for part in split_message(cached_response):
+                    await update.message.reply_text(
+                        part,
+                        parse_mode=telegram.constants.ParseMode.MARKDOWN_V2
+                    )
+                return
+            except telegram.error.BadRequest as e:
+                log_event("Markdown error", user_id, f"Falling back to plain text: {str(e)}")
+                for part in split_message(clean_text(cached_response)):
+                    await update.message.reply_text(part)
+                return
+
     try:
         # Запрос к OpenRouter API
         api_key = os.getenv("OPENROUTER_API_KEY")
         if not api_key:
             raise ValueError("API key for OpenRouter is not configured")
         
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                "https://openrouter.ai/api/v1/chat/completions",
-                json={
-                    "model": model_id,
-                    "messages": [{
-                        "role": "user",
-                        "content": f"Отвечай строго на русском, с правильной грамматикой и пунктуацией, без текста на других языках. Форматируй код в блоках ```python. {message_text}"
-                    }]
-                },
-                headers={"Authorization": f"Bearer {api_key}"},
-                timeout=30.0
-            )
-            response.raise_for_status()
+        async with httpx.AsyncClient(
+            limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
+            headers={"Authorization": f"Bearer {api_key}", "Accept-Encoding": "gzip, deflate"}
+        ) as client:
+            for attempt in range(2):  # Повторная попытка при 429
+                try:
+                    response = await client.post(
+                        "https://openrouter.ai/api/v1/chat/completions",
+                        json={
+                            "model": model_id,
+                            "messages": [{
+                                "role": "user",
+                                "content": f"Отвечай строго на русском, с правильной грамматикой и пунктуацией, без текста на других языках. Форматируй код в блоках ```python. {message_text}"
+                            }]
+                        },
+                        timeout=15.0
+                    )
+                    response.raise_for_status()
+                    break
+                except httpx.HTTPStatusError as e:
+                    if e.response.status_code == 429:
+                        log_event("Rate limit", user_id, "Rate limit exceeded, retrying after 5 seconds")
+                        await asyncio.sleep(5)
+                        continue
+                    raise
+
             response_data = response.json()
             reply_text = response_data.get("choices", [{}])[0].get("message", {}).get("content", "")
             
@@ -175,7 +211,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 code = code_match.group(1).strip()
                 explanation = re.sub(r"```(?:python)?\n?[\s\S]*?\n?```", "", reply_text).strip()
             else:
-                # Если блока кода нет, весь текст считаем кодом
                 code = reply_text.strip()
                 explanation = "Пример кода." if is_code(code) else ""
             
@@ -189,6 +224,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             log_event("Formatting error", user_id, "Empty formatted message")
             await update.message.reply_text("Не удалось обработать ответ. Попробуйте уточнить запрос.")
             return
+
+        # Сохраняем в кэш для кодовых запросов
+        if "код" in message_text.lower() or "while" in message_text.lower() or "for" in message_text.lower():
+            cache[cache_key] = formatted_message
 
         # Отправляем сообщение, разбивая на части, если нужно
         try:
@@ -235,8 +274,8 @@ def main():
     signal.signal(signal.SIGTERM, shutdown_handler)
     
     log_event("Polling started", 0, "Polling started")
-    # Увеличиваем интервал опроса до 30 секунд
-    app.run_polling(poll_interval=30.0)
+    # Уменьшаем интервал опроса до 20 секунд
+    app.run_polling(poll_interval=20.0)
 
 if __name__ == "__main__":
     main()
