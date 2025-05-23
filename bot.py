@@ -1,7 +1,13 @@
 import httpx
 import logging
+import re
 from datetime import datetime
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ParseMode
+)
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -22,11 +28,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Конфигурация (ваши данные)
+# Конфигурация
 OPENROUTER_API_KEY = "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"
 BOT_TOKEN = "7888772385:AAEGpPDVxsFBqjskcI__taTaa01VveBrVPM"
 
-# Доступные модели (ваш список)
+# Доступные модели
 MODELS = {
     "mistral-small": "mistralai/devstral-small:free",
     "deepseek-r1": "deepseek/deepseek-r1:free",
@@ -36,11 +42,27 @@ MODELS = {
 
 current_model = MODELS["mistral-small"]
 
-def format_code_block(text: str) -> str:
-    """Форматирует код для Telegram с определением языка"""
-    if "```" in text:
-        return text  # Уже отформатирован
-    return f"```python\n{text}\n```" if any(kw in text.lower() for kw in ["def ", "import ", "class ", "print("]) else f"```\n{text}\n```"
+def format_code_blocks(text: str) -> str:
+    """
+    Форматирует только блоки кода в тексте для Telegram,
+    оставляя обычный текст без изменений.
+    """
+    def escape_special_chars(match):
+        lang = match.group(1) or ''
+        code = match.group(2)
+        # Экранируем специальные символы MarkdownV2
+        escaped_code = re.sub(r'([_*\[\]()~`>#+\-=|{}.!])', r'\\\1', code)
+        return f'```{lang}\n{escaped_code}\n```'
+    
+    # Ищем все блоки кода и форматируем только их
+    formatted_text = re.sub(
+        r'```(\w*)\n(.*?)```',
+        escape_special_chars,
+        text,
+        flags=re.DOTALL
+    )
+    
+    return formatted_text if '```' in formatted_text else text
 
 def log_event(event: str, user_id: int = None, details: str = ""):
     """Логирование событий с timestamp"""
@@ -115,15 +137,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if response.status_code == 200:
                 answer = response.json()["choices"][0]["message"]["content"]
                 
-                # Форматируем код в ответе
-                formatted_answer = format_code_block(answer)
+                # Форматируем только блоки кода в ответе
+                formatted_answer = format_code_blocks(answer)
                 
-                log_event("API success", user.id, f"Response length: {len(answer)} chars")
+                # Определяем нужен ли parse_mode
+                use_markdown = '```' in formatted_answer
                 
-                # Отправляем с parse_mode='MarkdownV2' для форматирования
+                log_event("API success", user.id, 
+                         f"Response length: {len(answer)} chars | "
+                         f"Formatted: {use_markdown}")
+                
                 await update.message.reply_text(
                     formatted_answer,
-                    parse_mode='MarkdownV2'
+                    parse_mode=ParseMode.MARKDOWN_V2 if use_markdown else None
                 )
             else:
                 error_msg = f"❌ Ошибка {response.status_code}: {response.text[:200]}"
