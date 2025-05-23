@@ -1,4 +1,4 @@
-import os
+import httpx
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
@@ -13,7 +13,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_message = update.message.text
     
-    # Формируем запрос к OpenRouter API
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json"
@@ -25,19 +24,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }
     
     try:
-        response = await context.bot.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers=headers,
-            json=payload
-        )
-        
-        if response.status_code == 200:
-            bot_response = response.json()['choices'][0]['message']['content']
-            await update.message.reply_text(bot_response)
-        else:
-            error_msg = f"Ошибка API: {response.status_code} - {response.text}"
-            await update.message.reply_text(error_msg)
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers=headers,
+                json=payload,
+                timeout=30.0
+            )
             
+            if response.status_code == 200:
+                bot_response = response.json()['choices'][0]['message']['content']
+                await update.message.reply_text(bot_response)
+            else:
+                error_msg = f"Ошибка API: {response.status_code} - {response.text}"
+                await update.message.reply_text(error_msg)
+                
     except Exception as e:
         await update.message.reply_text(f"Произошла ошибка: {str(e)}")
 
@@ -45,10 +46,8 @@ if __name__ == '__main__':
     print('Запуск бота...')
     app = Application.builder().token(BOT_TOKEN).build()
     
-    # Обработчики команд
     app.add_handler(CommandHandler('start', start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
-    # Запуск бота
     print('Бот запущен. Нажмите Ctrl+C для остановки.')
     app.run_polling()
