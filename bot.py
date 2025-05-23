@@ -23,21 +23,24 @@ def escape_markdown_v2(text: str) -> str:
     return re.sub(TELEGRAM_MARKDOWN_SPECIAL_CHARS, r'\\\1', text)
 
 def clean_text(text: str) -> str:
-    """Удаляет не-русские и не-латинские символы, оставляя только безопасные."""
-    return re.sub(r'[^\w\sа-яА-ЯёЁ.,!?:;()\'"<>=\-+*\/]', '', text)
+    """Удаляет не-русские, не-латинские символы и текст на других языках."""
+    # Оставляем только буквы, цифры, пробелы, знаки препинания и русские символы
+    cleaned = re.sub(r'[^\w\sа-яА-ЯёЁ.,!?:;()\'"<>=\-+*\/]', '', text)
+    # Удаляем слова на других языках (например, китайский, испанский)
+    return ' '.join(word for word in cleaned.split() if re.match(r'^[a-zA-Zа-яА-ЯёЁ0-9]+$', word) or word in '.,!?:;()\'"<>=\-+*/')
 
 def format_code_message(code: str, explanation: str = "") -> str:
     """
     Форматирует сообщение с кодом и пояснением для Telegram MarkdownV2.
     Код отправляется как копируемый блок, пояснение — как текст.
     """
-    # Очищаем код и пояснение от нежелательных символов
-    code = clean_text(code)
-    explanation = clean_text(explanation)
-    # Код не экранируется, так как находится внутри ```python ... ```
-    code_block = f"```python\n{code.strip()}\n```"
-    if explanation:
-        # Экранируем только пояснение
+    # Очищаем код и пояснение
+    code = clean_text(code).strip()
+    explanation = clean_text(explanation).strip()
+    # Формируем блок кода
+    code_block = f"```python\n{code}\n```"
+    if explanation and explanation != code:
+        # Экранируем пояснение
         escaped_explanation = escape_markdown_v2(explanation)
         return f"{code_block}\n\n{escaped_explanation}"
     return code_block
@@ -102,7 +105,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "https://openrouter.ai/api/v1/chat/completions",
                 json={
                     "model": model_id,
-                    "messages": [{"role": "user", "content": message_text}]
+                    "messages": [{"role": "user", "content": f"Отвечай только на русском. {message_text}"}]
                 },
                 headers={"Authorization": f"Bearer {api_key}"},
                 timeout=30.0
@@ -112,18 +115,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_text = response_data["choices"][0]["message"]["content"]
             log_event("API success", user_id, f"Response length: {len(reply_text)} chars")
 
-        # Проверяем, содержит ли запрос упоминание кода или цикл
-        if "код" in message_text.lower() or "while" in message_text.lower() or "```" in reply_text:
-            # Разделяем ответ на код и пояснение
-            code_match = re.search(r"```(?:python)?\n([\s\S]*?)\n```", reply_text)
+        # Проверяем, связан ли запрос с кодом
+        if "код" in message_text.lower() or "while" in message_text.lower() or "for" in message_text.lower() or "```" in reply_text:
+            # Извлекаем код из ответа
+            code_match = re.search(r"```(?:python)?\n?([\s\S]*?)\n?```", reply_text)
             if code_match:
-                code = code_match.group(1)
+                code = code_match.group(1).strip()
                 # Всё, что вне блока кода, считаем пояснением
-                explanation = re.sub(r"```(?:python)?\n[\s\S]*?\n```", "", reply_text).strip()
+                explanation = re.sub(r"```(?:python)?\n?[\s\S]*?\n?```", "", reply_text).strip()
             else:
-                # Если блок кода не найден, считаем весь текст кодом
-                code = reply_text
-                explanation = "Пример кода с циклом while." if "while" in message_text.lower() else ""
+                # Если блока кода нет, весь текст считаем кодом
+                code = reply_text.strip()
+                explanation = ""
             
             # Форматируем сообщение с копируемым кодом
             formatted_message = format_code_message(code, explanation)
@@ -176,7 +179,8 @@ def main():
     signal.signal(signal.SIGTERM, shutdown_handler)
     
     log_event("Polling started", 0, "Polling started")
-    app.run_polling()
+    # Увеличиваем интервал опроса до 30 секунд
+    app.run_polling(poll_interval=30.0)
 
 if __name__ == "__main__":
     main()
