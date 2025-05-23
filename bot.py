@@ -30,8 +30,8 @@ MODELS = [
 ]
 DEFAULT_MODEL = MODELS[0]
 MAX_MESSAGE_LENGTH = 4096  # Максимальная длина сообщения в Telegram
-RATE_LIMIT_PERIOD = 60  # Период в секундах (1 минута)
-RATE_LIMIT_CALLS = 3  # 3 запроса в минуту
+RATE_LIMIT_PERIOD = 120  # 2 минуты
+RATE_LIMIT_CALLS = 1  # 1 запрос в 2 минуты
 CACHE_SIZE = 100  # Размер кэша для ответов
 MAX_HISTORY = 50  # 50 сообщений в истории диалога
 
@@ -47,24 +47,27 @@ def escape_markdown_v2(text):
     special_chars = r'([_\*\[\]\(\)~`>\#\+\-=|\{\}\.!])'
     return re.sub(special_chars, r'\\\1', text)
 
-# Проверка, содержит ли текст китайские иероглифы
-def is_non_russian(text):
+# Проверка на китайские иероглифы
+def has_chinese(text):
     """Проверяет, содержит ли текст китайские иероглифы (U+4E00–U+9FFF)."""
     for char in text:
-        if 0x4E00 <= ord(char) <= 0x9FFF:  # Диапазон китайских иероглифов
+        if 0x4E00 <= ord(char) <= 0x9FFF:
             return True
     return False
 
-# Очистка текста от не-UTF-8 символов
-def clean_text(text):
+# Очистка текста
+def clean_text(text, is_code=False):
     """Очищает текст от не-UTF-8 символов и проверяет на китайские иероглифы."""
     try:
         # Нормализация Unicode
         text = unicodedata.normalize('NFKC', text)
         # Удаляем не-UTF-8 символы
         text = text.encode('utf-8', errors='ignore').decode('utf-8')
+        # Пропускаем проверку на китайские символы для кода
+        if is_code:
+            return text
         # Проверяем на китайские иероглифы
-        if is_non_russian(text):
+        if has_chinese(text):
             logger.warning(f"Chinese characters detected in response: {text[:50]}...")
             return "Ошибка: Ответ содержит текст на китайском языке. Пожалуйста, повторите запрос."
         return text
@@ -95,13 +98,13 @@ def split_message(text, max_length=MAX_MESSAGE_LENGTH):
 # Форматирование кода для Telegram
 def format_code_block(code, language=""):
     """Форматирует код в MarkdownV2 для Telegram."""
-    cleaned_code = clean_text(code)
+    cleaned_code = clean_text(code, is_code=True)
     if "Ошибка: Ответ содержит текст на китайском языке" in cleaned_code:
         return cleaned_code
     escaped_code = escape_markdown_v2(cleaned_code)
     return f"```{language}\n{escaped_code}\n```"
 
-# Тестовый запрос к OpenRouter API
+# Проверка состояния API
 async def test_openrouter_api():
     """Выполняет тестовый запрос к OpenRouter API."""
     headers = {
@@ -119,8 +122,10 @@ async def test_openrouter_api():
     try:
         response = session.post(OPENROUTER_API_URL, headers=headers, json=payload, timeout=10)
         response.raise_for_status()
-        logger.info("Test API request successful")
-        return "Тест API успешен!"
+        remaining_requests = response.headers.get('X-RateLimit-Remaining', 'Unknown')
+        reset_time = response.headers.get('X-RateLimit-Reset', 'Unknown')
+        logger.info(f"Test API request successful. Remaining requests: {remaining_requests}, Reset time: {reset_time}")
+        return f"Тест API успешен! Осталось запросов: {remaining_requests}, Сброс лимита: {reset_time}"
     except requests.exceptions.HTTPError as e:
         logger.error(f"Test API request failed: {e}")
         return f"Ошибка API: {str(e)}"
@@ -147,7 +152,6 @@ async def query_openrouter(message, model=DEFAULT_MODEL, history=None):
         "X-Title": "TelegramOpenRouterBot"
     }
     
-    # Усиленное системное сообщение
     system_message = {
         "role": "system",
         "content": "Отвечай исключительно на русском языке. Не используй китайский, английский или другие языки, если только пользователь явно не попросит. Для кода используй Python, если не указано иное."
@@ -165,7 +169,9 @@ async def query_openrouter(message, model=DEFAULT_MODEL, history=None):
         data = response.json()
         result = clean_text(data['choices'][0]['message']['content'])
         cache[cache_key] = result  # Сохраняем в кэш
-        logger.info(f"API request successful, model: {model}, response: {result[:50]}...")
+        remaining_requests = response.headers.get('X-RateLimit-Remaining', 'Unknown')
+        reset_time = response.headers.get('X-RateLimit-Reset', 'Unknown')
+        logger.info(f"API request successful, model: {model}, response: {result[:50]}..., Remaining requests: {remaining_requests}, Reset time: {reset_time}")
         return result
     except requests.exceptions.HTTPError as e:
         logger.error(f"HTTP error from OpenRouter: {e}")
@@ -230,7 +236,7 @@ async def button_callback(update: Update, context: CallbackContext):
 # Обработчик текстовых сообщений
 async def handle_message(update: Update, context: CallbackContext):
     """Обрабатывает входящие текстовые сообщения."""
-    user_message = clean_text(update.message.text)
+    user_message = clean_text(update.message.text, is_code=False)
     model = context.user_data.get('model', DEFAULT_MODEL)
     
     # Получаем или инициализируем историю
@@ -256,14 +262,14 @@ async def handle_message(update: Update, context: CallbackContext):
         formatted_response = ""
         for i, part in enumerate(parts):
             if i % 2 == 0:  # Текст вне кода
-                formatted_response += escape_markdown_v2(clean_text(part))
+                formatted_response += escape_markdown_v2(clean_text(part, is_code=False))
             else:  # Код
                 lines = part.split('\n', 1)
                 language = lines[0].strip() if len(lines) > 1 and lines[0].strip() else ""
                 code = lines[1] if len(lines) > 1 else lines[0]
                 formatted_response += format_code_block(code, language)
     else:
-        formatted_response = escape_markdown_v2(clean_text(response))
+        formatted_response = escape_markdown_v2(clean_text(response, is_code=False))
     
     # Разбиваем сообщение
     messages = split_message(formatted_response)
