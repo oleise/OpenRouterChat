@@ -1,12 +1,9 @@
 import httpx
 import logging
 import re
-from datetime import datetime
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup
-)
+import asyncio
+from datetime import datetime, timedelta
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
@@ -41,7 +38,90 @@ MODELS = {
     "deepcoder": "agentica-org/deepcoder-14b-preview:free"
 }
 
+# Ограничение запросов
+RATE_LIMIT = 3  # запросов в секунду
+last_request_time = datetime.now() - timedelta(seconds=1)
 current_model = MODELS["mistral-small"]
+
+def escape_markdown(text: str) -> str:
+    """Экранирует специальные символы MarkdownV2"""
+    escape_chars = r'_*[]()~`>#+-=|{}.!'
+    return re.sub(f'([{re.escape(escape_chars)}])', r'\\\1', text)
+
+def format_code_blocks(text: str) -> str:
+    """Форматирует только блоки кода между ```, сохраняя остальной текст"""
+    def process_code(match):
+        lang = match.group(1) or ''
+        code = match.group(2)
+        escaped_code = escape_markdown(code)
+        return f'```{lang}\n{escaped_code}\n```'
+    
+    return re.sub(
+        r'```(\w*)\n(.*?)```',
+        process_code,
+        text,
+        flags=re.DOTALL
+    )
+
+async def safe_reply(update: Update, text: str):
+    """Безопасная отправка сообщения с автоматическим форматированием кода"""
+    try:
+        # Сначала пробуем с Markdown
+        formatted = format_code_blocks(text)
+        if '```' in formatted:
+            await update.message.reply_text(formatted, parse_mode=ParseMode.MARKDOWN_V2)
+        else:
+            await update.message.reply_text(text)
+    except BadRequest:
+        # Если ошибка форматирования - отправляем как есть
+        await update.message.reply_text(escape_markdown(text))
+
+async def rate_limiter():
+    """Ограничитель частоты запросов"""
+    global last_request_time
+    elapsed = (datetime.now() - last_request_time).total_seconds()
+    if elapsed < 1/RATE_LIMIT:
+        wait_time = 1/RATE_LIMIT - elapsed
+        await asyncio.sleep(wait_time)
+    last_request_time = datetime.now()
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        await rate_limiter()  # Ограничение частоты запросов
+        
+        headers = {
+            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+            "HTTP-Referer": "https://github.com",
+            "X-Title": "Telegram-AI-Bot",
+            "Content-Type": "application/json"
+        }
+        
+        payload = {
+            "model": current_model,
+            "messages": [{"role": "user", "content": update.message.text}],
+            "max_tokens": 1000
+        }
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers=headers,
+                json=payload
+            )
+            
+            if response.status_code == 200:
+                answer = response.json()["choices"][0]["message"]["content"]
+                await safe_reply(update, answer)
+            else:
+                error_msg = f"API Error: {response.status_code}"
+                if response.status_code == 429:
+                    error_msg += "\n\n⚠️ Слишком много запросов. Подождите 10 секунд."
+                    await asyncio.sleep(10)
+                await update.message.reply_text(error_msg)
+                
+    except Exception as e:
+        logger.error(f"Error: {str(e)}", exc_info=True)
+        await update.message.reply_text(f"⚠️ Произошла ошибка: {str(e)}")
 
 def escape_markdown(text: str) -> str:
     """Экранирует специальные символы MarkdownV2"""
@@ -186,12 +266,13 @@ if __name__ == "__main__":
     
     try:
         app = Application.builder().token(BOT_TOKEN).build()
-        
+        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    # Добавьте другие обработчики...
+    # Добавьте другие обработчики...        
         app.add_handler(CommandHandler("start", start))
         app.add_handler(CommandHandler("model", model_list))
         app.add_handler(CallbackQueryHandler(button_handler))
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-        
         log_event("Polling started")
         app.run_polling()
         
