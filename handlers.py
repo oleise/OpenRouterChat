@@ -4,8 +4,8 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 import httpx
 from tenacity import retry, stop_after_attempt, wait_fixed
-from OpenRouterChat.config import OPENROUTER_API_KEY, API_TIMEOUT, MODELS, logger
-from OpenRouterChat.utils import clean_text, escape_markdown_v2, format_code_message, is_code, sanitize_input, send_message
+from config import OPENROUTER_API_KEY, API_TIMEOUT, MODELS, logger
+from utils import clean_text, escape_markdown_v2, format_code_message, is_code, sanitize_input, send_message
 from cachetools import TTLCache
 
 # Кэш для ответов (TTL 1 час, до 1000 записей)
