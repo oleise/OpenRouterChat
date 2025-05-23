@@ -1,15 +1,7 @@
-import os
-import sys
 import signal
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters
-
-# Добавляем текущую директорию в sys.path для поддержки абсолютных импортов
-current_dir = os.path.dirname(os.path.abspath(__file__))
-if current_dir not in sys.path:
-    sys.path.insert(0, current_dir)
-
-from OpenRouterChat.config import TELEGRAM_TOKEN, logger, MODELS
-from OpenRouterChat.handlers import start, callback_query, handle_message
+from config import TELEGRAM_TOKEN, logger, MODELS
+from handlers import start, callback_query, handle_message
 
 def handle_shutdown(app: Application) -> callable:
     """
