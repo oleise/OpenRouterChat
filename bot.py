@@ -47,26 +47,26 @@ def escape_markdown_v2(text):
     special_chars = r'([_\*\[\]\(\)~`>\#\+\-=|\{\}\.!])'
     return re.sub(special_chars, r'\\\1', text)
 
-# Проверка, содержит ли текст не-русские символы
+# Проверка, содержит ли текст китайские иероглифы
 def is_non_russian(text):
-    """Проверяет, содержит ли текст не-кириллические или не-латинские символы."""
+    """Проверяет, содержит ли текст китайские иероглифы (U+4E00–U+9FFF)."""
     for char in text:
-        if not (0x0400 <= ord(char) <= 0x04FF or char.isascii()):
+        if 0x4E00 <= ord(char) <= 0x9FFF:  # Диапазон китайских иероглифов
             return True
     return False
 
-# Очистка текста от не-UTF-8 и не-русских символов
+# Очистка текста от не-UTF-8 символов
 def clean_text(text):
-    """Очищает текст от не-UTF-8 символов и проверяет язык."""
+    """Очищает текст от не-UTF-8 символов и проверяет на китайские иероглифы."""
     try:
         # Нормализация Unicode
         text = unicodedata.normalize('NFKC', text)
         # Удаляем не-UTF-8 символы
         text = text.encode('utf-8', errors='ignore').decode('utf-8')
-        # Проверяем, содержит ли текст не-русские символы
+        # Проверяем на китайские иероглифы
         if is_non_russian(text):
-            logger.warning("Non-Russian text detected in response")
-            return "Ошибка: Ответ содержит текст на другом языке. Пожалуйста, повторите запрос."
+            logger.warning(f"Chinese characters detected in response: {text[:50]}...")
+            return "Ошибка: Ответ содержит текст на китайском языке. Пожалуйста, повторите запрос."
         return text
     except Exception as e:
         logger.error(f"Error cleaning text: {e}")
@@ -96,10 +96,37 @@ def split_message(text, max_length=MAX_MESSAGE_LENGTH):
 def format_code_block(code, language=""):
     """Форматирует код в MarkdownV2 для Telegram."""
     cleaned_code = clean_text(code)
-    if "Ошибка: Ответ содержит текст на другом языке" in cleaned_code:
+    if "Ошибка: Ответ содержит текст на китайском языке" in cleaned_code:
         return cleaned_code
     escaped_code = escape_markdown_v2(cleaned_code)
     return f"```{language}\n{escaped_code}\n```"
+
+# Тестовый запрос к OpenRouter API
+async def test_openrouter_api():
+    """Выполняет тестовый запрос к OpenRouter API."""
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+        "User-Agent": "TelegramBot/1.0",
+        "HTTP-Referer": "https://your-bot-domain.com",
+        "X-Title": "TelegramOpenRouterBot"
+    }
+    payload = {
+        "model": DEFAULT_MODEL,
+        "messages": [{"role": "system", "content": "Отвечай на русском языке"}, {"role": "user", "content": "Тест"}]
+    }
+    
+    try:
+        response = session.post(OPENROUTER_API_URL, headers=headers, json=payload, timeout=10)
+        response.raise_for_status()
+        logger.info("Test API request successful")
+        return "Тест API успешен!"
+    except requests.exceptions.HTTPError as e:
+        logger.error(f"Test API request failed: {e}")
+        return f"Ошибка API: {str(e)}"
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Test API network error: {e}")
+        return "Ошибка сети при тестировании API."
 
 # Запрос к OpenRouter API
 @sleep_and_retry
@@ -160,7 +187,8 @@ async def start(update: Update, context: CallbackContext):
         f"Текущая модель: {DEFAULT_MODEL}\n"
         "Используй /models для выбора модели через кнопки.\n"
         "Диалог сохраняется (до 50 сообщений).\n"
-        "Используй /clear для очистки истории диалога."
+        "Используй /clear для очистки истории диалога.\n"
+        "Используй /test_api для проверки API-ключа."
     )
 
 # Обработчик команды /clear
@@ -168,6 +196,12 @@ async def clear(update: Update, context: CallbackContext):
     """Очищает историю диалога."""
     context.user_data['history'] = []
     await update.message.reply_text("История диалога очищена.")
+
+# Обработчик команды /test_api
+async def test_api(update: Update, context: CallbackContext):
+    """Проверяет API-ключ OpenRouter."""
+    result = await test_openrouter_api()
+    await update.message.reply_text(result)
 
 # Обработчик команды /models
 async def models(update: Update, context: CallbackContext):
@@ -264,6 +298,7 @@ def main():
     # Регистрация обработчиков
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("clear", clear))
+    application.add_handler(CommandHandler("test_api", test_api))
     application.add_handler(CommandHandler("models", models))
     application.add_handler(CallbackQueryHandler(button_callback, pattern="^model:"))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
