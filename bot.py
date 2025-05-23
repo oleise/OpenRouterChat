@@ -10,7 +10,11 @@ import httpx
 # Настройка логирования
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+    level=logging.INFO,
+    handlers=[
+        logging.FileHandler("bot.log"),
+        logging.StreamHandler()
+    ]
 )
 logger = logging.getLogger(__name__)
 # Отключаем логирование httpx для getUpdates
@@ -22,57 +26,70 @@ MAX_MESSAGE_LENGTH = 4096  # Ограничение длины сообщени�
 
 def escape_markdown_v2(text: str) -> str:
     """Экранирует специальные символы для Telegram MarkdownV2, кроме блоков кода."""
+    if not text:
+        return ""
     return re.sub(TELEGRAM_MARKDOWN_SPECIAL_CHARS, r'\\\1', text)
 
 def clean_text(text: str) -> str:
-    """Фильтрует слова на других языках и восстанавливает базовую пунктуацию."""
-    # Фильтруем слова, оставляя только русские или латинские (для кода)
-    words = text.split()
-    filtered_words = [word for word in words if re.match(r'^[a-zA-Zа-яА-ЯёЁ0-9]+$', word) or word in '.,!?:;()\'"<>=\-+*/']
-    cleaned = ' '.join(filtered_words)
+    """Добавляет базовую пунктуацию и минимально очищает текст."""
+    if not text:
+        return ""
+    # Удаляем только управляющие символы, оставляем иероглифы и другие символы
+    cleaned = re.sub(r'[\x00-\x1F\x7F]', '', text)
     # Добавляем точки в конце предложений
-    sentences = re.split(r'(?<=[.!?])\s+|(?<=\w)\s+(?=[А-ЯЁ])', cleaned)
+    sentences = re.split(r'(?<=[.!?])\s+|(?<=\w)\s+(?=[А-ЯЁ])', cleaned.strip())
     cleaned_sentences = [s + '.' if s and s[-1] not in '.!?' else s for s in sentences]
     return ' '.join(cleaned_sentences).strip()
 
 def is_code(text: str) -> bool:
     """Проверяет, является ли текст кодом (содержит синтаксис Python)."""
+    if not text:
+        return False
     code_patterns = [
         r'\bdef\b', r'\bclass\b', r'\bwhile\b', r'\bfor\b', r'\bif\b',
         r'\bprint\b', r'\bimport\b', r'=', r'\(', r'\)', r':'
     ]
-    return any(re.search(pattern, text) for pattern in code_patterns)
+    return any(re.search(pattern, text, re.IGNORECASE) for pattern in code_patterns)
 
 def validate_code(code: str) -> str:
     """Проверяет и исправляет базовые ошибки в коде."""
+    if not code:
+        return ""
     lines = code.split('\n')
     corrected_lines = []
     for line in lines:
         # Исправляем ошибки типа "while count count 1"
-        if 'while' in line and line.count('count') > 2:
-            line = re.sub(r'while\s+count\s+count\s+1', 'while count <= 5:', line)
+        if 'while' in line.lower() and line.count('count') > 2:
+            line = re.sub(r'while\s+count\s+count\s+1', 'while count <= 5:', line, flags=re.IGNORECASE)
         corrected_lines.append(line)
     return '\n'.join(corrected_lines).strip()
 
 def format_code_message(code: str, explanation: str = "") -> str:
     """
     Форматирует сообщение с кодом и пояснением для Telegram MarkdownV2.
-    Код отправляется как копируемый блок, пояснение — как текст.
+    Код отправляется как копiруемый блок, пояснение — как текст.
     """
-    code = clean_text(validate_code(code)).strip()
+    code = validate_code(clean_text(code)).strip()
     explanation = clean_text(explanation).strip()
-    # Если текст похож на код, оборачиваем его в ```python
-    if is_code(code) and code:
-        code_block = f"```python\n{code}\n```"
-    else:
-        code_block = ""
-    if explanation and explanation != code and len(explanation) > 10:
+    
+    # Если код пустой, возвращаем только пояснение или сообщение об ошибке
+    if not code and not explanation:
+        return "Не удалось сгенерировать ответ. Попробуйте уточнить запрос."
+    
+    # Формируем блок кода, если текст похож на код
+    code_block = f"```python\n{code}\n```" if code and is_code(code) else ""
+    
+    # Добавляем пояснение, если оно есть и не совпадает с кодом
+    if explanation and explanation != code and len(explanation) > 5:
         escaped_explanation = escape_markdown_v2(explanation)
         return f"{code_block}\n\n{escaped_explanation}" if code_block else escaped_explanation
-    return code_block or explanation
+    
+    return code_block or escape_markdown_v2(explanation)
 
 def split_message(text: str, max_length: int = MAX_MESSAGE_LENGTH) -> list:
     """Разбивает длинное сообщение на части, не превышающие max_length."""
+    if not text:
+        return []
     return [text[i:i + max_length] for i in range(0, len(text), max_length)]
 
 def log_event(event_type: str, user_id: int, message: str, exc_info: bool = False):
@@ -131,15 +148,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "https://openrouter.ai/api/v1/chat/completions",
                 json={
                     "model": model_id,
-                    "messages": [{"role": "user", "content": f"Отвечай строго на русском, с правильной грамматикой и пунктуацией, без текста на других языках. Форматируй код в блоках ```python. {message_text}"}]
+                    "messages": [{
+                        "role": "user",
+                        "content": f"Отвечай строго на русском, с правильной грамматикой и пунктуацией, без текста на других языках. Форматируй код в блоках ```python. {message_text}"
+                    }]
                 },
                 headers={"Authorization": f"Bearer {api_key}"},
                 timeout=30.0
             )
             response.raise_for_status()
             response_data = response.json()
-            reply_text = response_data["choices"][0]["message"]["content"]
-            log_event("API success", user_id, f"Response length: {len(reply_text)} chars")
+            reply_text = response_data.get("choices", [{}])[0].get("message", {}).get("content", "")
+            
+            if not reply_text:
+                log_event("API error", user_id, "Empty response from OpenRouter")
+                await update.message.reply_text("Не удалось получить ответ от API. Попробуйте позже.")
+                return
+            
+            log_event("API success", user_id, f"Response length: {len(reply_text)} chars\nResponse: {reply_text[:100]}...")
 
         # Проверяем, связан ли запрос с кодом
         if "код" in message_text.lower() or "while" in message_text.lower() or "for" in message_text.lower() or "```" in reply_text:
@@ -159,6 +185,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Для некодовых ответов экранируем весь текст
             formatted_message = escape_markdown_v2(clean_text(reply_text))
 
+        if not formatted_message:
+            log_event("Formatting error", user_id, "Empty formatted message")
+            await update.message.reply_text("Не удалось обработать ответ. Попробуйте уточнить запрос.")
+            return
+
         # Отправляем сообщение, разбивая на части, если нужно
         try:
             for part in split_message(formatted_message):
@@ -174,7 +205,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except httpx.HTTPStatusError as e:
         error_msg = f"API error ❌ Ошибка {e.response.status_code}: {e.response.text}"
-        log_event("API error", user_id, error_msg)
+        log_event("API error", user_id, error_msg, exc_info=True)
         await update.message.reply_text(error_msg)
     except Exception as e:
         error_msg = f"Unexpected error: {str(e)}"
