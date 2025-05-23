@@ -5,9 +5,9 @@ from datetime import datetime
 from telegram import (
     Update,
     InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    ParseMode
+    InlineKeyboardMarkup
 )
+from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
     CommandHandler,
